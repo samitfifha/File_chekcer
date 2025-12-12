@@ -241,8 +241,101 @@ def check_file_exists(ip_address, directory_path, filename, username=None, passw
 
 def process_excel(file_path, filename_to_check, directory_path, username=None, password=None):
     """
-    Process the uploaded Excel file and check for file existence
-    Uses default credentials if none provided
+    Process an Excel file containing server information and check for file existence on network shares.
+
+    This function reads an Excel file containing server IP addresses and store codes (CodeMag),
+    then attempts to locate a specified file on each server's network share. It supports
+    authenticated network connections and automatically falls back to default credentials
+    if none are provided and USE_DEFAULT_CREDENTIALS is True.
+
+    Args:
+        file_path (str): Absolute path to the Excel file to process. The file must be readable
+            and in a valid Excel format (.xlsx or .xls).
+        filename_to_check (str): Name of the file to search for on each network share.
+            Can include extension (e.g., "config.xml", "data.json").
+        directory_path (str): Relative path within the network share where the file should
+            be located. Should not include leading/trailing slashes.
+            Example: "cylande\\TomcatUR\\Data\\In"
+        username (str, optional): Windows domain username for network authentication.
+            Format can be "DOMAIN\\username" or "username". Defaults to None.
+        password (str, optional): Password for network authentication. Defaults to None.
+
+    Returns:
+        dict: A dictionary containing the processing results with the following structure:
+            On success:
+                {
+                    'success': True,
+                    'results': [
+                        {
+                            'CodeMag': str,           # Store code from Excel
+                            'IPAddress': str,         # Server IP address
+                            'FileName': str,          # File being checked
+                            'Exists': str,            # 'Yes' or 'No'
+                            'FilePath': str,          # Full UNC path to file
+                            'FileSize': int or None,  # File size in bytes (if exists)
+                            'LastModified': str or None,  # Timestamp 'YYYY-MM-DD HH:MM:SS'
+                            'Error': str or None      # Error message if check failed
+                        },
+                        ...
+                    ]
+                }
+            On error:
+                {
+                    'error': str  # Detailed error message
+                }
+
+    Raises:
+        This function catches all exceptions internally and returns them in the error format.
+        Possible exceptions that may be caught include:
+        - FileNotFoundError: If the Excel file doesn't exist
+        - pd.errors.ParserError: If the Excel file is corrupted or invalid
+        - KeyError: If required columns are missing from Excel
+        - PermissionError: If network share access is denied
+        - OSError: If network path is invalid or unreachable
+
+    Excel File Requirements:
+        The Excel file must contain the following columns (case-sensitive):
+        - 'CodeMag': Store or location identifier code
+        - 'ipaddress': IP address or hostname of the network share server
+
+    Network Path Construction:
+        For each row in the Excel file, the function constructs paths as:
+        \\\\<ipaddress>\\<directory_path>\\<filename_to_check>
+        Example: \\\\172.17.1.3\\cylande\\TomcatUR\\Data\\config.xml
+
+    Authentication Behavior:
+        1. If username and password are provided: Uses provided credentials
+        2. If credentials are None and USE_DEFAULT_CREDENTIALS=True: Uses DEFAULT_USERNAME/PASSWORD
+        3. If credentials are None and USE_DEFAULT_CREDENTIALS=False: Attempts anonymous access
+
+        Network connections are established using the Windows 'net use' command via
+        connect_to_network_share() for each unique IP address.
+
+    Example:
+        >>> result = process_excel(
+        ...     file_path='/uploads/servers.xlsx',
+        ...     filename_to_check='config.xml',
+        ...     directory_path='cylande\\TomcatUR\\Data',
+        ...     username='DOMAIN\\admin',
+        ...     password='securepass123'
+        ... )
+        >>> if result.get('success'):
+        ...     for item in result['results']:
+        ...         print(f"{item['CodeMag']}: {item['Exists']}")
+        ... else:
+        ...     print(f"Error: {result['error']}")
+
+    Notes:
+        - Progress is logged for each processed row using the logger
+        - File metadata (size, modification time) is only retrieved if file exists
+        - Network connections may be cached in active_connections dictionary
+        - Large Excel files may take significant time as each server is checked sequentially
+        - The function does not modify the Excel file or any network files
+
+    See Also:
+        - check_file_exists(): Performs individual file existence checks
+        - get_credentials(): Handles credential resolution
+        - connect_to_network_share(): Establishes network connections
     """
     try:
         # Read Excel file
