@@ -11,6 +11,9 @@ from pathlib import Path
 import socket
 import traceback
 import subprocess
+import signal
+import shutil
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ===== DEFAULT CREDENTIALS CONFIGURATION =====
 # Set your default Windows credentials here
@@ -68,6 +71,10 @@ logger = logging.getLogger(__name__)
 
 # Store active network connections
 active_connections = {}
+
+# Transfer progress tracking
+transfer_progress = {'current_code_mag': '', 'completed': 0, 'total': 0, 'running': False}
+transfer_progress_lock = threading.Lock()
 
 
 def get_credentials(username=None, password=None):
@@ -355,7 +362,6 @@ def transfer_file_to_servers(file_path, servers_excel, directory_path, username=
                 os.makedirs(dest_dir, exist_ok=True)
                 
                 # Copy file
-                import shutil
                 shutil.copy2(file_path, dest_path)
                 
                 results.append({
@@ -648,15 +654,106 @@ def transfer_files():
             file.save(temp_filepath)
             temp_filepaths.append(temp_filepath)
         
-        # Transfer all files (will use default credentials)
+        # Transfer all files to all servers in parallel (10 servers at a time)
         all_results = []
-        for temp_filepath in temp_filepaths:
-            result = transfer_files_to_servers(temp_filepath, excel_path, directory_path)
-            if 'error' not in result:
-                all_results.extend(result['results'])
-            else:
-                # If one file fails, log it but continue with others
-                logger.error(f"Error transferring file {temp_filepath}: {result['error']}")
+        try:
+            username, password = get_credentials(None, None)
+            df = pd.read_excel(excel_path)
+
+            if 'CodeMag' not in df.columns or 'ipaddress' not in df.columns:
+                return jsonify({'error': 'Excel must contain "CodeMag" and "ipaddress" columns'}), 400
+
+            total_servers = len(df)
+            with transfer_progress_lock:
+                transfer_progress['total'] = total_servers
+                transfer_progress['completed'] = 0
+                transfer_progress['current_code_mag'] = ''
+                transfer_progress['running'] = True
+
+            def transfer_to_one_server(code_mag, ip_address):
+                """Transfer all files to a single server. Runs in a worker thread."""
+                results = []
+
+                with transfer_progress_lock:
+                    transfer_progress['current_code_mag'] = code_mag
+
+                # Connect once for this server
+                if username and password:
+                    connection_result = connect_to_network_share(ip_address, username, password)
+                    if not connection_result['success']:
+                        for temp_filepath in temp_filepaths:
+                            results.append({
+                                'CodeMag': code_mag,
+                                'IPAddress': ip_address,
+                                'FileName': os.path.basename(temp_filepath),
+                                'Status': 'Failed',
+                                'DestinationPath': f'\\\\{ip_address}\\{directory_path}\\{os.path.basename(temp_filepath)}',
+                                'Error': f"Échec de connexion: {connection_result['message']}"
+                            })
+                        with transfer_progress_lock:
+                            transfer_progress['completed'] += 1
+                        return results
+
+                # Send all files to this server
+                for temp_filepath in temp_filepaths:
+                    filename = os.path.basename(temp_filepath)
+                    if ip_address.startswith('\\\\'):
+                        dest_path = os.path.join(ip_address, directory_path, filename)
+                    else:
+                        dest_path = os.path.join(f'\\\\{ip_address}', directory_path, filename)
+                    dest_path = os.path.normpath(dest_path)
+
+                    try:
+                        dest_dir = os.path.dirname(dest_path)
+                        os.makedirs(dest_dir, exist_ok=True)
+                        shutil.copy2(temp_filepath, dest_path)
+                        results.append({
+                            'CodeMag': code_mag,
+                            'IPAddress': ip_address,
+                            'FileName': filename,
+                            'Status': 'Success',
+                            'DestinationPath': dest_path,
+                            'Error': None
+                        })
+                        logger.info(f"Transferred: {code_mag} - {ip_address} - {filename}")
+                    except Exception as e:
+                        logger.error(f"Error transferring {filename} to {ip_address}: {str(e)}")
+                        results.append({
+                            'CodeMag': code_mag,
+                            'IPAddress': ip_address,
+                            'FileName': filename,
+                            'Status': 'Failed',
+                            'DestinationPath': dest_path,
+                            'Error': str(e)
+                        })
+
+                with transfer_progress_lock:
+                    transfer_progress['completed'] += 1
+                return results
+
+            # Run transfers in parallel — 10 concurrent workers
+            with ThreadPoolExecutor(max_workers=10) as executor:
+                futures = {}
+                for _, row in df.iterrows():
+                    code_mag = str(row['CodeMag'])
+                    ip_address = str(row['ipaddress'])
+                    future = executor.submit(transfer_to_one_server, code_mag, ip_address)
+                    futures[future] = code_mag
+
+                for future in as_completed(futures):
+                    try:
+                        all_results.extend(future.result())
+                    except Exception as e:
+                        logger.error(f"Worker error for {futures[future]}: {str(e)}")
+
+        except Exception as e:
+            logger.error(f"Error reading Excel or transferring: {str(e)}")
+            with transfer_progress_lock:
+                transfer_progress['running'] = False
+            return jsonify({'error': str(e)}), 500
+        finally:
+            with transfer_progress_lock:
+                transfer_progress['running'] = False
         
         # Generate report
         report_filename = f"transfer_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
@@ -767,7 +864,6 @@ def transfer_files_to_servers(file_path, servers_excel, directory_path, username
                 os.makedirs(dest_dir, exist_ok=True)
                 
                 # Copy file
-                import shutil
                 shutil.copy2(file_path, dest_path)
                 
                 results.append({
@@ -1103,6 +1199,45 @@ def transfer_file():
         return jsonify({'error': str(e)}), 500
 
 
+
+@app.route('/transfer-progress', methods=['GET'])
+def get_transfer_progress():
+    """Return current transfer progress"""
+    with transfer_progress_lock:
+        return jsonify(dict(transfer_progress))
+
+
+@app.route('/shutdown', methods=['POST'])
+def shutdown():
+    """Shutdown the Flask server gracefully"""
+    try:
+        logger.info("Shutdown request received")
+        
+        # Disconnect all active connections
+        for connection_key in list(active_connections.keys()):
+            ip = active_connections[connection_key]['ip']
+            disconnect_from_network_share(ip)
+        
+        # Schedule shutdown — use non-daemon thread so it survives main thread exit
+        def shutdown_server():
+            import time
+            time.sleep(1)  # Give time for response to be sent
+            logger.info("Shutting down server...")
+            os._exit(0)
+
+        t = threading.Thread(target=shutdown_server)
+        t.daemon = False
+        t.start()
+        
+        return jsonify({
+            'success': True,
+            'message': 'Server is shutting down...'
+        }), 200
+    
+    except Exception as e:
+        logger.error(f"Shutdown error: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
 def open_browser():
     """Open the browser after a short delay"""
     import time
@@ -1110,8 +1245,27 @@ def open_browser():
     webbrowser.open('http://127.0.0.1:5001')
 
 
+def kill_process_on_port(port):
+    """Kill any existing process using the given port so the app can start cleanly."""
+    try:
+        result = subprocess.run(
+            f'netstat -ano | findstr :{port} | findstr LISTENING',
+            capture_output=True, text=True, shell=True
+        )
+        for line in result.stdout.strip().splitlines():
+            parts = line.split()
+            pid = parts[-1]
+            if pid.isdigit() and int(pid) != os.getpid():
+                subprocess.run(f'taskkill /F /PID {pid}', shell=True,
+                               capture_output=True)
+    except Exception:
+        pass
+
+
 if __name__ == '__main__':
     try:
+        kill_process_on_port(5001)
+
         print("=" * 60)
         print("File Checker Application")
         print("=" * 60)
